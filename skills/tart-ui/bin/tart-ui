@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
-# tart-ui — see and drive a Tart macOS VM's GUI over plain SSH.
-# Every subcommand is a single one-shot ssh call: no daemon, no persistent
-# connection, no session state to keep in sync. Safe to interleave with
-# anything else touching the same VM.
+# tart-ui — see and drive a Tart macOS VM's GUI.
+# The screen is reached through Tart's built-in VNC server
+# (`tart run --vnc-experimental`), which serves the VM's real console
+# framebuffer from Virtualization.framework: screenshots, pointer and keyboard
+# all go over that one RFB channel while SIP stays enabled in the guest and
+# nothing is written to the TCC databases. Commands run over plain SSH.
+# Every subcommand is one-shot: no daemon, no persistent connection, no session
+# state to keep in sync. See references/backends.md.
 set -uo pipefail
 
 VM="${TART_VM:-uitest}"
@@ -61,8 +65,8 @@ install_key() {
   [ -f "$KEY" ] || { log "generating $KEY"; ssh-keygen -t ed25519 -N '' -C tart-ui -f "$KEY" -q; }
   gssh 'true' 2>/dev/null && return 0
   local pub; pub="$(cat "$KEY.pub")"
-  # The trailing `sync` is required: `tart stop` cuts power without a
-  # filesystem flush, so an unsynced authorized_keys is lost.
+  # The trailing `sync` matters: a power cut before the filesystem flushes
+  # would lose an unsynced authorized_keys.
   gssh_pw "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && \
            (grep -qF '$pub' ~/.ssh/authorized_keys || printf '%s\n' '$pub' >> ~/.ssh/authorized_keys) && \
            chmod 600 ~/.ssh/authorized_keys && sync" >/dev/null \
@@ -77,21 +81,6 @@ wait_ssh() {
     sleep 3
   done
   return 1
-}
-
-# uictl is built on the host and copied in; the guest needs no compiler and no
-# package manager.
-build_uictl() {
-  local out="$CONF_DIR/uictl" src="$SKILL_DIR/src/uictl.c"
-  [ -f "$src" ] || die "missing $src"
-  if [ ! -x "$out" ] || [ "$src" -nt "$out" ]; then
-    command -v clang >/dev/null || die "clang not found — run: xcode-select --install"
-    mkdir -p "$CONF_DIR"
-    clang -O2 -o "$out" "$src" -framework ApplicationServices -framework CoreFoundation \
-      || die "failed to build uictl"
-    log "built $out"
-  fi
-  echo "$out"
 }
 
 # ------------------------------------------------------------------ lifecycle
@@ -110,17 +99,21 @@ cmd_create() {
 cmd_boot() {
   vm_running && { log "'$VM' already running"; return 0; }
   mkdir -p "$CONF_DIR/logs"
-  log "booting '$VM' headless"
+  log "booting '$VM' on Tart's VNC display"
   local vmlog="$CONF_DIR/logs/$VM.log"
   : > "$vmlog"
-  # Audio pass-through is off by default because it is noise for UI work, but an
-  # audio app under test needs it: TART_AUDIO=1. Spelled out as two branches
-  # because macOS ships bash 3.2, where `set -u` rejects an empty array
-  # expansion.
+  # --vnc-experimental attaches a real VZ display and serves it over VNC; that
+  # attached display is also what lets auto-login own the console and bring
+  # the desktop up (a display-less guest stays parked at loginwindow).
+  # --no-graphics only suppresses opening a host viewer window for it.
+  # Audio pass-through is off by default because it is noise for UI work, but
+  # an audio app under test needs it: TART_AUDIO=1. Spelled out as two
+  # branches because macOS ships bash 3.2, where `set -u` rejects an empty
+  # array expansion.
   if [ "${TART_AUDIO:-0}" = "1" ]; then
-    nohup tart run "$VM" --no-graphics </dev/null >>"$vmlog" 2>&1 &
+    nohup tart run "$VM" --vnc-experimental --no-graphics </dev/null >>"$vmlog" 2>&1 &
   else
-    nohup tart run "$VM" --no-graphics --no-audio </dev/null >>"$vmlog" 2>&1 &
+    nohup tart run "$VM" --vnc-experimental --no-graphics --no-audio </dev/null >>"$vmlog" 2>&1 &
   fi
   disown
   # macOS caps concurrent VZ guests (2 on most Macs). Report that immediately
@@ -129,68 +122,84 @@ cmd_boot() {
   if grep -qi "exceeds the system limit" "$vmlog"; then
     die "$(cat "$vmlog") — stop another VM first (tart list)"
   fi
+  parse_vnc_endpoint "$vmlog" || die "'$VM' printed no VNC endpoint (see $vmlog): $(tail -3 "$vmlog")"
   wait_ssh 420 || die "'$VM' did not reach SSH in time (see $vmlog): $(tail -3 "$vmlog")"
-  log "up at $(vm_ip)"
+  log "up at $(vm_ip), vnc on 127.0.0.1:$(awk '{print $2}' "$CONF_DIR/$VM.vnc")"
 }
 
-# Push the payload and run it. Kept separate because a reboot wipes /tmp, so
-# everything has to be copied in again on the second pass.
-push_and_provision() {
-  local prov="$SKILL_DIR/provision/provision.sh" uictl ip
-  uictl="$(build_uictl)" || exit 1
-  ip="$(vm_ip)"
-  scp -i "$KEY" "${ssh_opts[@]}" -q "$uictl" "$GUEST_USER@$ip:/tmp/uictl" || die "copy uictl failed"
-  gssh 'mkdir -p ~/bin && mv /tmp/uictl ~/bin/uictl && chmod +x ~/bin/uictl'
-  scp -i "$KEY" "${ssh_opts[@]}" -q "$prov" "$GUEST_USER@$ip:/tmp/provision.sh" || die "copy provision failed"
-  gssh "TART_PASS='$GUEST_PASS' bash /tmp/provision.sh"
+# The port and password are random on every `tart run`; the only place they
+# exist is one line of boot output, either
+#   Opening vnc://:PW@127.0.0.1:PORT...           (viewer window mode)
+#   VNC server is running at vnc://:PW@127.0.0.1:PORT   (--no-graphics)
+# Parse whichever appears and persist HOST PORT PASSWORD for every later call.
+parse_vnc_endpoint() {
+  local vmlog="$1" deadline=$((SECONDS + 60)) line
+  while [ $SECONDS -lt $deadline ]; do
+    line="$(grep -oE 'vnc://:[^@]+@[0-9.]+:[0-9]+' "$vmlog" | head -1)"
+    if [ -n "$line" ]; then
+      local pw="${line#vnc://:}"; pw="${pw%%@*}"
+      local hp="${line##*@}"
+      printf '%s %s %s\n' "${hp%%:*}" "${hp##*:}" "$pw" > "$CONF_DIR/$VM.vnc"
+      chmod 600 "$CONF_DIR/$VM.vnc"
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+# One short-lived RFB connection per operation, against the endpoint persisted
+# at boot.
+rfb() {
+  local ep="$CONF_DIR/$VM.vnc" host port pw
+  [ -f "$ep" ] || die "no VNC endpoint for '$VM' (not booted by tart-ui? try: tart-ui boot)"
+  read -r host port pw < "$ep"
+  python3 "$SKILL_DIR/bin/rfb.py" --host "$host" --port "$port" --password "$pw" "$@"
 }
 
 cmd_provision() {
-  [ -f "$SKILL_DIR/provision/provision.sh" ] || die "missing $SKILL_DIR/provision/provision.sh"
+  local prov="$SKILL_DIR/provision/provision.sh"
+  [ -f "$prov" ] || die "missing $prov"
   install_key
-  push_and_provision
-  local rc=$?
-  if [ $rc -eq 42 ]; then
-    # SIP was just switched off; it only takes effect after a restart.
-    log "rebooting to apply the SIP change"
-    gssh 'sync; sudo shutdown -r now' >/dev/null 2>&1 || true
-    sleep 20
-    wait_ssh 420 || die "'$VM' did not come back after reboot"
-    push_and_provision || die "provisioning failed after reboot"
-  elif [ $rc -ne 0 ]; then
-    die "provisioning failed"
-  fi
+  scp -i "$KEY" "${ssh_opts[@]}" -q "$prov" "$GUEST_USER@$(vm_ip):/tmp/provision.sh" || die "copy provision failed"
+  gssh "TART_PASS='$GUEST_PASS' bash /tmp/provision.sh" || die "provisioning failed"
 }
 
-# Each attempt uses a new ssh connection by design: tccd caches its verdict per
-# sshd session, so a session that predates the grant stays denied.
+# A pass is a real desktop, not a lit display: the console must belong to the
+# logged-in user (auto-login makes stat report 501, loginwindow leaves it 0),
+# the session agents that draw the desktop must be up (on a cold boot the
+# wallpaper renders seconds before the menu bar and Dock do), and the
+# framebuffer must hold an actual picture. A uniform frame compresses to
+# almost nothing, so the size floor rejects black/asleep screens too.
 cmd_verify() {
-  local i
-  for i in $(seq 1 10); do
-    if gssh 'screencapture -x -t png /tmp/tart-ui-probe.png >/dev/null 2>&1; s=0; [ -s /tmp/tart-ui-probe.png ] || s=1; rm -f /tmp/tart-ui-probe.png; [ $s -eq 0 ] && ~/bin/uictl size >/dev/null' 2>/dev/null; then
-      gssh 'touch ~/.tart-ui-provisioned; sync'
-      return 0
+  local i probe="${TMPDIR:-/tmp}/tart-ui-verify.$$.png"
+  for i in $(seq 1 40); do
+    if gssh '[ "$(stat -f %u /dev/console)" = 501 ] && pgrep -x Dock >/dev/null \
+             && pgrep -x Finder >/dev/null && pgrep -x ControlCenter >/dev/null' 2>/dev/null; then
+      sleep 3   # give the freshly started agents a moment to actually draw
+      if rfb shot "$probe" >/dev/null 2>&1 && [ -s "$probe" ] \
+         && [ "$(wc -c < "$probe" | tr -d ' ')" -gt 40000 ]; then
+        rm -f "$probe"; return 0
+      fi
     fi
-    # A granted capture can still fail while macOS's "…requesting to bypass
-    # the system private window picker" sheet is in front of it. Clearing the
-    # sheet is a no-op when none is present.
-    [ $i -ge 2 ] && cmd_button Allow >/dev/null 2>&1
+    rm -f "$probe"
     sleep 3
   done
   return 1
 }
 
 cmd_up() {
-  cmd_create; cmd_boot
-  if gssh 'test -f ~/.tart-ui-provisioned' 2>/dev/null && cmd_verify; then
+  cmd_create; cmd_boot; install_key
+  if gssh 'test -f ~/.tart-ui-provisioned' 2>/dev/null; then
     log "already provisioned"
   else
     cmd_provision
-    cmd_verify || die "provisioned, but screen capture is still denied.
-        Check: tart-ui sh 'csrutil status'  (must say disabled)
-        and    tart-ui sh \"log show --last 2m --predicate 'subsystem == \\\"com.apple.TCC\\\"' --style compact | grep AUTHREQ\""
+    gssh 'touch ~/.tart-ui-provisioned; sync'
   fi
-  log "ready — TART_VM=$VM ip=$(vm_ip) display=$(gssh '~/bin/uictl size')"
+  cmd_verify || die "the guest did not reach a usable desktop.
+        Check: tart-ui shot /tmp/probe.png   (a login screen? try: tart-ui login)
+        and    tart-ui sh 'stat -f %u /dev/console'   (must be 501)"
+  log "ready — TART_VM=$VM ip=$(vm_ip) display=$(cmd_size)"
 }
 
 cmd_down() {
@@ -218,118 +227,66 @@ cmd_bake() {
 }
 
 # --------------------------------------------------------------------- screen
-# Two screencapture behaviours shape this:
-#  - it refuses any dot-prefixed filename ("cannot write file to intended
-#    destination") in every directory, so the temp name must not start with a
-#    dot;
-#  - it exits 0 even when that write fails, so the file is the only reliable
-#    success signal.
-cmd_shot() {
-  local out="${1:--}" r="/tmp/tart-ui-shot.$$.png"
-  local remote="screencapture -x -t png '$r' >/dev/null 2>&1; if [ -s '$r' ]; then cat '$r'; rm -f '$r'; else rm -f '$r'; exit 1; fi"
-  if [ "$out" = "-" ]; then
-    gssh "$remote"
-  else
-    gssh "$remote" > "$out" || { rm -f "$out"; die "capture failed — provisioned? GUI logged in?"; }
-    [ -s "$out" ] || { rm -f "$out"; die "capture produced an empty file"; }
-    log "wrote $out ($(file -b "$out" | cut -d, -f2 | tr -d ' '))"
-  fi
-}
+cmd_shot() { rfb shot "${1:--}"; }
+cmd_size() { rfb size; }
 
 # ---------------------------------------------------------------------- input
-U='~/bin/uictl'
-cmd_click()  { gssh "$U click $1 $2 ${3:-left} ${4:-1}"; }
-cmd_dclick() { gssh "$U click $1 $2 left 2"; }
-cmd_rclick() { gssh "$U click $1 $2 right 1"; }
-cmd_move()   { gssh "$U move $1 $2"; }
-cmd_drag()   { gssh "$U drag $1 $2 $3 $4"; }
-cmd_scroll() { gssh "$U scroll ${1:--3} ${2:-0}"; }
-cmd_size()   { gssh "$U size"; }
-
-cmd_type() {
-  # base64 so quoting and UTF-8 survive two shells in a row.
-  local b64; b64="$(printf '%s' "$*" | base64)"
-  gssh "$U type \"\$(printf %s '$b64' | base64 --decode)\""
+btn() { case "$1" in right) echo 3 ;; middle) echo 2 ;; *) echo 1 ;; esac; }
+cmd_click()  { rfb click "$1" "$2" --button "$(btn "${3:-left}")" --count "${4:-1}"; }
+cmd_dclick() { rfb click "$1" "$2" --count 2; }
+cmd_rclick() { rfb click "$1" "$2" --button 3; }
+cmd_move()   { rfb move "$1" "$2"; }
+cmd_drag()   { rfb drag "$1" "$2" "$3" "$4"; }
+cmd_scroll() {
+  if [ $# -ge 3 ]; then rfb scroll "$1" "$2" "$3"; else rfb scroll "${1:--3}"; fi
 }
+cmd_type()   { rfb type "$*"; }
+cmd_key()    { rfb key "$*"; }
 
-# "cmd+shift+4" -> uictl key 4 cmd shift
-cmd_key() {
-  local combo="$*" mods=() k out=""
-  IFS='+' read -ra parts <<< "$combo"
-  for k in "${parts[@]}"; do
-    case "$k" in
-      cmd|command|ctrl|control|alt|opt|option|shift|fn) mods+=("$k") ;;
-      *) out="$k" ;;
-    esac
-  done
-  [ -n "$out" ] || die "no key in '$combo'"
-  gssh "$U key $out ${mods[*]:-}"
+# Type the account password at the loginwindow / lock screen and confirm the
+# desktop actually came back. Auto-login plus the provisioning that disables
+# the screen lock make this rare, but a guest paused long enough can still
+# present a lock.
+cmd_login() {
+  rfb login --login-password "$GUEST_PASS"
+  sleep 5
+  cmd_verify || die "typed the password, but the desktop did not come back — check: tart-ui shot"
+  log "desktop unlocked"
 }
 
 # ------------------------------------------------------------------ app focus
+# lsappinfo talks to the launch-services daemon directly and needs no TCC
+# grant, unlike System Events, which would need Accessibility.
 cmd_frontmost() {
-  gssh 'osascript -e '"'"'tell application "System Events" to get name of first process whose frontmost is true'"'"''
+  gssh 'lsappinfo info -only name "$(lsappinfo front)"' \
+    | sed -E 's/^"LSDisplayName"="(.*)"$/\1/'
 }
 
-# Two separate conditions have to hold before an app can receive keystrokes,
-# and they do not become true together: the process takes focus first, and its
-# window can appear a second or more later. Waiting on focus alone sends input
-# to a window that does not exist yet.
+# Launch and wait until the app owns the screen. Frontmost is the usable
+# signal available without an Accessibility grant; the extra settle covers the
+# gap between taking focus and the first window appearing.
 cmd_open() {
   local app="${1:?usage: tart-ui open <AppName>}"
   gssh "open -a '$app' || exit 1
         for i in \$(seq 1 60); do
-          f=\$(osascript -e 'tell application \"System Events\" to get name of first process whose frontmost is true' 2>/dev/null)
-          if [ \"\$f\" = '$app' ]; then
-            w=\$(osascript -e 'tell application \"System Events\" to tell process \"$app\" to get count of windows' 2>/dev/null)
-            [ \"\${w:-0}\" -gt 0 ] 2>/dev/null && { echo \"ready: $app (\$w window(s))\"; exit 0; }
-          fi
+          f=\$(lsappinfo info -only name \"\$(lsappinfo front)\" 2>/dev/null)
+          case \"\$f\" in *'\"$app\"'*) sleep 1; echo 'ready: $app'; exit 0 ;; esac
           sleep 0.5
         done
-        echo \"WARN: '$app' not ready after 30s (frontmost=\$f windows=\${w:-0})\" >&2; exit 1"
+        echo \"WARN: '$app' did not become frontmost after 30s (\$f)\" >&2; exit 1"
 }
-
-# Click a button by its accessibility name. The scan covers every process, not
-# only the frontmost one: macOS's screen-recording consent sheet belongs to
-# UserNotificationCenter rather than to the app being driven.
-cmd_button() {
-  local name="${1:?usage: tart-ui button <ButtonName>}"
-  gssh "osascript -e '
-    tell application \"System Events\"
-      repeat with p in (every application process)
-        try
-          repeat with w in (every window of p)
-            try
-              click (first button of w whose name is \"$name\")
-              return \"clicked in \" & (name of p)
-            end try
-          end repeat
-        end try
-      end repeat
-    end tell
-    return \"not found: $name\"'"
-}
-
-# The screen-recording consent sheet, by name. Harmless when none is showing.
-cmd_allow() { cmd_button Allow; }
 
 # -------------------------------------------------------------------- viewing
-# Open a live view of the running VM. Nothing is restarted and the automation is
-# unaffected: this is macOS screen sharing alongside the SSH channel, so a
-# person can watch a run in progress and take over the mouse if they want to.
+# Open a live, interactive view of the VM's console in the host's Screen
+# Sharing app, against the same Tart VNC endpoint the automation uses. Close
+# the window to detach; the VM keeps running.
 cmd_watch() {
-  local ip; ip="$(vm_ip)"
-  [ -n "$ip" ] || die "VM '$VM' is not running"
-  if ! nc -z -G 3 "$ip" 5900 2>/dev/null; then
-    log "enabling screen sharing in the guest"
-    gssh 'sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
-            -activate -configure -access -on -restart -agent -privs -all >/dev/null 2>&1' || true
-    local i
-    for i in 1 2 3 4 5 6 7 8; do nc -z -G 3 "$ip" 5900 2>/dev/null && break; sleep 2; done
-  fi
-  nc -z -G 3 "$ip" 5900 2>/dev/null || die "screen sharing did not come up on $ip:5900"
-  log "opening a viewer on $ip (close the window to detach; the VM keeps running)"
-  open "vnc://$GUEST_USER:$GUEST_PASS@$ip"
+  vm_running || die "VM '$VM' is not running"
+  local ep="$CONF_DIR/$VM.vnc" host port pw
+  [ -f "$ep" ] || die "no VNC endpoint for '$VM' (not booted by tart-ui?)"
+  read -r host port pw < "$ep"
+  log "opening a viewer on $host:$port (close the window to detach)"
+  open "vnc://:$pw@$host:$port"
 }
 
 # ------------------------------------------------------------------- commands
@@ -346,23 +303,28 @@ cmd_xctest() {
 
 usage() {
   cat >&2 <<EOF
-tart-ui — see and drive a Tart macOS VM over plain SSH (every call is one-shot)
+tart-ui — see and drive a Tart macOS VM's GUI (every call is one-shot)
 
   Lifecycle   up [VM] | down [VM] | bake <image> | provision [VM] | rm [VM] | ip [VM] | status
   Eyes        shot [FILE|-]            PNG of the guest screen, 1:1 with click coords
               size                     display size
   Hands       click X Y [left|right] [n] | dclick | rclick | move | drag X1 Y1 X2 Y2
-              scroll DY [DX] | type <text> | key <combo>       e.g. key cmd+space
-  Focus       open <AppName>           launch and wait until it owns the keyboard
-              frontmost | button <Name> | allow   (clears the consent sheet)
-  Watching    watch [VM]               open a live screen-sharing view of the VM
+              scroll DY [X Y] | type <text> | key <combo>      e.g. key cmd+space
+  Focus       open <AppName>           launch and wait until it is frontmost
+              frontmost                name of the frontmost app
+  Watching    watch [VM]               open a live viewer on the VM's console
+              login [VM]               type the password at a login/lock screen
   Commands    sh <cmd…> | push <l> <r> | pull <r> <l> | xctest <xcodebuild args…>
 
   A VM-scoped command takes the VM name inline, e.g.  tart-ui watch my-vm
   Otherwise TART_VM (or --vm) selects it.
 
+  The screen goes through Tart's own VNC server (tart run --vnc-experimental):
+  SIP stays enabled in the guest and no TCC database is touched.
+
   Env: TART_VM(=$VM) TART_IMAGE(=$IMAGE) TART_DISPLAY(=$DISPLAY_SIZE) TART_CPU TART_MEMORY
        TART_AUDIO=1 to pass host audio through to the guest
+       RFB_KEY_PRESS/RFB_KEY_GAP to slow typing for a picky app
 EOF
   exit 2
 }
@@ -377,7 +339,7 @@ sub="$1"; shift
 # the VM to act on. Consuming it here is what stops `tart-ui rm some-vm` from
 # silently ignoring the name and operating on the default one instead.
 case "$sub" in
-  up|boot|create|provision|down|stop|rm|delete|ip|watch|size|frontmost|allow)
+  up|boot|create|provision|down|stop|rm|delete|ip|watch|size|frontmost|login|unlock)
     if [ $# -gt 0 ]; then VM="$1"; shift; fi
     [ $# -eq 0 ] || die "'$sub' takes at most a VM name, got: $*"
     ;;
@@ -387,7 +349,7 @@ case "$sub" in
   up) cmd_up "$@" ;;            create) cmd_create "$@" ;;
   boot) cmd_boot "$@" ;;        provision) cmd_provision "$@" ;;
   down|stop) cmd_down "$@" ;;   bake) cmd_bake "$@" ;;
-  rm|delete) cmd_down; tart delete "$VM" ;;
+  rm|delete) cmd_down; tart delete "$VM"; rm -f "$CONF_DIR/$VM.vnc" ;;
   ip) vm_ip ;;                  status|list) tart list ;;
   shot|screenshot) cmd_shot "$@" ;;   size) cmd_size ;;
   click) cmd_click "$@" ;;      dclick|doubleclick) cmd_dclick "$@" ;;
@@ -396,7 +358,7 @@ case "$sub" in
   type) cmd_type "$@" ;;        key) cmd_key "$@" ;;
   open) cmd_open "$@" ;;        frontmost) cmd_frontmost ;;
   watch) cmd_watch ;;
-  button) cmd_button "$@" ;;  allow) cmd_allow ;;
+  login|unlock) cmd_login ;;
   sh|exec) cmd_sh "$@" ;;       push) cmd_push "$@" ;;  pull) cmd_pull "$@" ;;
   xctest) cmd_xctest "$@" ;;
   *) usage ;;
