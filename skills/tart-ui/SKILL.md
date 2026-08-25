@@ -6,10 +6,15 @@ description: Drive a real macOS GUI inside a disposable Tart VM - take screensho
 # tart-ui
 
 Eyes and hands on a throwaway macOS desktop: `shot` returns a PNG of the guest
-screen, `click`/`type`/`key` post real HID events into it, and `sh` runs
-arbitrary commands. Each command is one `ssh` round trip, with no session to
-open, keep alive, or clean up, so calls can be interleaved with other work and
-resumed after a context switch.
+screen, `click`/`type`/`key` post real input into it, and `sh` runs arbitrary
+commands. The screen is reached through Tart's own VNC server — the VM's real
+console framebuffer, read on the host side of the virtualization boundary — so
+**SIP stays enabled in the guest and no TCC database is ever written**. The
+guest is a faithful stand-in for a real Mac, not a security-relaxed one.
+
+Each command is one round trip with no session to open, keep alive, or clean
+up, so calls can be interleaved with other work and resumed after a context
+switch.
 
 `bin/tart-ui` is the only entry point. Add it to PATH, or call it by path:
 
@@ -24,13 +29,14 @@ export TART_VM=uitest                         # every command targets this VM
 TART_VM=uitest tart-ui up                     # TART_IMAGE selects the base image
 ```
 
+`up` clones the image, boots it under Tart's VNC display, installs an SSH key,
+quiets the desktop (no display sleep, screen saver, or screen lock), and does
+not return until the guest is sitting on a **real logged-in desktop**, verified
+by a screenshot. It is idempotent and safe to re-run.
+
 `TART_IMAGE` defaults to `ghcr.io/cirruslabs/macos-tahoe-vanilla:latest`, whose
 first use downloads tens of GB; set it to a local image name to clone that
-instead. `up` is idempotent and safe to re-run.
-
-From a stock *vanilla* image the first run takes about a minute, most of it the
-SIP-off reboot (see [references/tcc.md](references/tcc.md) for why that is
-needed). From an image you have already baked it is a ~11 second boot.
+instead. From an image you have already baked, `up` is a ~15 second boot.
 
 **macOS runs at most two VMs at once.** `tart list` shows what is up; `tart-ui
 up` fails immediately when the slot is taken instead of hanging until timeout.
@@ -53,23 +59,23 @@ halve anything.
 ```bash
 tart-ui click 719 445            # also: rclick, dclick, move
 tart-ui drag 100 100 400 300
-tart-ui scroll -5                # negative scrolls down
+tart-ui scroll -5                # negative scrolls down; scroll DY [X Y]
 tart-ui type 'echo hello'
-tart-ui key cmd+space            # key return / key escape / key cmd+shift+4
-tart-ui button Save              # click a button by its accessibility name
-tart-ui allow                    # clear macOS's screen-recording consent sheet
+tart-ui key cmd+space            # key return / key escape / key cmd+shift+3
 ```
 
-`button` scans every process, so it also reaches system sheets that do not
-belong to the app being driven. Prefer it to pixel coordinates whenever the
-target has an accessibility name.
+`type` and `key` are fast and lossless into ordinary apps. `cmd`, `opt`,
+`ctrl` and `shift` modifiers all work (`key cmd+space`, `key cmd+shift+3`). If a
+particularly picky app drops characters, slow typing with
+`RFB_KEY_PRESS`/`RFB_KEY_GAP` (seconds per key press / gap).
 
 ## Run commands
 
 ```bash
 tart-ui sh 'sw_vers -productVersion'
 tart-ui push ./MyApp.app /tmp/   ;  tart-ui pull /tmp/result.log ./
-tart-ui open Terminal            # launches AND waits until it owns the keyboard
+tart-ui open Terminal            # launches AND waits until it is frontmost
+tart-ui frontmost                # name of the frontmost app
 tart-ui xctest -project My.xcodeproj -scheme MyAppUITests test
 ```
 
@@ -90,8 +96,18 @@ tart-ui shot /tmp/2.png          # confirm the click landed before the next one
 
 **Never `sleep N` then type.** An app takes focus before its window exists, and
 keystrokes sent into that gap are dropped silently while the launch still looks
-successful. `tart-ui open` waits for both conditions; after any other action
-that changes focus, confirm with `tart-ui frontmost` or a screenshot.
+successful. `tart-ui open` waits until the app is frontmost; after any other
+action that changes focus, confirm with `tart-ui frontmost` or a screenshot.
+
+## If the guest is showing a login screen
+
+Auto-login and the disabled screen lock mean the VM normally sits on the
+desktop. A guest paused long enough can still present a lock; `tart-ui login`
+types the account password and confirms the desktop came back.
+
+```bash
+tart-ui login                    # get a locked guest back to its desktop
+```
 
 ## Save your work into a new base image
 
@@ -104,29 +120,33 @@ Bake after installing anything worth keeping. **Shut down with `tart-ui down`,
 never `tart stop`** — `tart stop` is a hard power cut that discards unsynced
 writes without warning.
 
-## What this VM is not
+## What this VM is and is not
 
-Provisioning disables SIP, so **the guest is not a faithful stand-in for a user's
-Mac wherever SIP is what changes the behaviour**. Anything refused with
-"Operation not permitted while System Integrity Protection is engaged" — most
-`launchctl` verbs against system domains, writes under `/System`, attaching to
-platform binaries — will *succeed here and fail in the field*. A test that
-depends on that boundary passes in this VM and tells you nothing. Verify those
-paths on a SIP-on machine.
+The guest runs with **SIP enabled** and its TCC databases untouched, so
+behaviour that depends on System Integrity Protection — `launchctl` against
+system domains, writes under `/System`, code-signing and platform-binary rules
+— matches a real Mac. A test that turns on that boundary is meaningful here.
 
-Audio pass-through is off unless `TART_AUDIO=1`, and the guest has no camera.
+What it does not cover:
+
+- **Accessibility-name automation.** Addressing controls by accessibility name
+  (System Events, `AXUIElement`) needs the guest's Accessibility permission,
+  which would mean writing TCC; tart-ui does not. Drive by pixel coordinates
+  and screenshots instead. `frontmost` and `open` use `lsappinfo`, which needs
+  no grant.
+- **Camera:** none. **Audio:** off unless `TART_AUDIO=1`.
 
 ## When something looks wrong
 
 | Symptom | Cause |
 |---|---|
-| `could not create image from display` | TCC denial, *not* a missing display. Re-run `tart-ui provision`. |
-| Screenshot fine, clicks do nothing | Accessibility/PostEvent grant missing, or SIP came back on. `tart-ui sh 'csrutil status'`. |
-| A consent sheet covers the screen | `tart-ui allow`. macOS re-asks on its own timer; provisioning defers it but cannot fully suppress it. Captures still succeed — the sheet just pollutes the frame. |
-| A capture "succeeded" but the file is missing | `screencapture` exits 0 even when it fails to write, and it refuses **any dot-prefixed filename** in any directory. Never name a capture `.something.png`, and check the file, not `$?`. |
-| Typing goes to the wrong place | Focus, not input. Check `tart-ui frontmost`. |
+| `up` reports the desktop never came back | The console is on loginwindow. `tart-ui shot` to see it, then `tart-ui login`. |
+| A screenshot is uniformly black | The display slept. Provisioning disables sleep; on a fresh unprovisioned guest, any input wakes it. |
+| Clicks land, keystrokes don't | Focus, not input. Check `tart-ui frontmost`; a login/lock screen also drops normal-speed keys — use `tart-ui login`. |
+| A modifier chord does nothing | Use `cmd`/`opt`/`ctrl`/`shift` names; wheel scrolling and Home/End/PageUp/PageDown are not delivered by the VNC server (see references/backends.md). |
 | `exceeds the system limit` | Two VMs already running. |
 
-[references/tcc.md](references/tcc.md) documents how the TCC grants are
-derived, how to re-diagnose them from tccd's logs, and why SIP must be
-disabled. Read it before changing `provision/provision.sh`.
+[references/backends.md](references/backends.md) documents how the VNC channel
+works — endpoint discovery, the pseudo-encoding requirement, the keysym and
+button maps, pacing, and the channel's limits. Read it before changing
+`bin/rfb.py` or `provision/provision.sh`.
