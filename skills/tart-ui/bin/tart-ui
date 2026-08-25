@@ -1,0 +1,359 @@
+#!/usr/bin/env bash
+# tart-ui — see and drive a Tart macOS VM's GUI over plain SSH.
+# Every subcommand is a single one-shot ssh call: no daemon, no persistent
+# connection, no session state to keep in sync. Safe to interleave with
+# anything else touching the same VM.
+set -uo pipefail
+
+VM="${TART_VM:-uitest}"
+IMAGE="${TART_IMAGE:-ghcr.io/cirruslabs/macos-tahoe-vanilla:latest}"
+GUEST_USER="${TART_USER:-admin}"
+GUEST_PASS="${TART_PASS:-admin}"
+CPU="${TART_CPU:-6}"
+MEMORY="${TART_MEMORY:-8192}"
+DISPLAY_SIZE="${TART_DISPLAY:-1440x900}"
+CONF_DIR="${TART_UI_HOME:-$HOME/.config/tart-ui}"
+KEY="$CONF_DIR/id_ed25519"
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SKILL_DIR="$(cd "$SELF_DIR/.." && pwd)"
+
+log() { printf '[tart-ui] %s\n' "$*" >&2; }
+die() { printf '[tart-ui] ERROR: %s\n' "$*" >&2; exit 1; }
+
+ssh_opts=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+          -o LogLevel=ERROR -o ConnectTimeout=10 -o ServerAliveInterval=15)
+
+vm_ip()      { tart ip "$VM" 2>/dev/null; }
+vm_exists()  { tart list 2>/dev/null | awk '{print $2}' | grep -qx "$VM"; }
+vm_running() { tart list 2>/dev/null | awk -v v="$VM" '$2==v {print $NF}' | grep -q running; }
+
+gssh() {
+  local ip; ip="$(vm_ip)"
+  [ -n "$ip" ] || die "VM '$VM' has no IP (not running? try: tart-ui up)"
+  ssh -i "$KEY" "${ssh_opts[@]}" -o BatchMode=yes "$GUEST_USER@$ip" "$@"
+}
+
+# Password login, used exactly once per VM to plant the key.
+gssh_pw() {
+  command -v expect >/dev/null || die "'expect' is needed for first-time key install"
+  # Values go through the environment: `expect -c` does not populate $argv,
+  # and interpolating a password into the Tcl source would need escaping.
+  TU_USER="$GUEST_USER" TU_IP="$(vm_ip)" TU_CMD="$1" TU_PASS="$GUEST_PASS" expect -c '
+    set timeout 60
+    spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              -o LogLevel=ERROR -o PreferredAuthentications=password \
+              -o NumberOfPasswordPrompts=1 -o ConnectTimeout=10 \
+              -o PubkeyAuthentication=no $env(TU_USER)@$env(TU_IP) $env(TU_CMD)
+    # The timeout branch is not optional: without it expect falls through to
+    # `wait` and blocks forever on a child that is never going to finish.
+    expect {
+      "assword:" { send "$env(TU_PASS)\r"; exp_continue }
+      timeout    { catch {exec kill -9 [exp_pid]}; exit 124 }
+      eof        {}
+    }
+    catch wait result
+    exit [lindex $result 3]
+  '
+}
+
+install_key() {
+  mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR"
+  [ -f "$KEY" ] || { log "generating $KEY"; ssh-keygen -t ed25519 -N '' -C tart-ui -f "$KEY" -q; }
+  gssh 'true' 2>/dev/null && return 0
+  local pub; pub="$(cat "$KEY.pub")"
+  # The trailing `sync` is required: `tart stop` cuts power without a
+  # filesystem flush, so an unsynced authorized_keys is lost.
+  gssh_pw "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && \
+           (grep -qF '$pub' ~/.ssh/authorized_keys || printf '%s\n' '$pub' >> ~/.ssh/authorized_keys) && \
+           chmod 600 ~/.ssh/authorized_keys && sync" >/dev/null \
+    || die "could not install ssh key (is the guest password '$GUEST_PASS'?)"
+}
+
+wait_ssh() {
+  local deadline=$((SECONDS + ${1:-420})) ip
+  while [ $SECONDS -lt $deadline ]; do
+    ip="$(vm_ip)"
+    [ -n "$ip" ] && nc -z -G 2 "$ip" 22 2>/dev/null && return 0
+    sleep 3
+  done
+  return 1
+}
+
+# uictl is built on the host and copied in; the guest needs no compiler and no
+# package manager.
+build_uictl() {
+  local out="$CONF_DIR/uictl" src="$SKILL_DIR/src/uictl.c"
+  [ -f "$src" ] || die "missing $src"
+  if [ ! -x "$out" ] || [ "$src" -nt "$out" ]; then
+    command -v clang >/dev/null || die "clang not found — run: xcode-select --install"
+    mkdir -p "$CONF_DIR"
+    clang -O2 -o "$out" "$src" -framework ApplicationServices -framework CoreFoundation \
+      || die "failed to build uictl"
+    log "built $out"
+  fi
+  echo "$out"
+}
+
+# ------------------------------------------------------------------ lifecycle
+cmd_create() {
+  vm_exists && { log "VM '$VM' already exists"; return 0; }
+  log "cloning $IMAGE -> $VM"
+  tart clone "$IMAGE" "$VM" || die "clone failed"
+  # A bare WxH is interpreted as points and macOS then picks a HiDPI mode, so
+  # screenshots come back at 2x and every coordinate needs halving. Forcing
+  # "px" keeps the framebuffer 1:1 with the numbers you feed to `click`.
+  local disp="$DISPLAY_SIZE"; [[ "$disp" =~ (px|pt)$ ]] || disp="${disp}px"
+  tart set "$VM" --cpu "$CPU" --memory "$MEMORY" --display "$disp" \
+                 --no-display-refit --random-mac
+}
+
+cmd_boot() {
+  vm_running && { log "'$VM' already running"; return 0; }
+  mkdir -p "$CONF_DIR/logs"
+  log "booting '$VM' headless"
+  local vmlog="$CONF_DIR/logs/$VM.log"
+  : > "$vmlog"
+  nohup tart run "$VM" --no-graphics --no-audio </dev/null >>"$vmlog" 2>&1 &
+  disown
+  # macOS caps concurrent VZ guests (2 on most Macs). Report that immediately
+  # rather than waiting out the full SSH timeout on a VM that never started.
+  sleep 3
+  if grep -qi "exceeds the system limit" "$vmlog"; then
+    die "$(cat "$vmlog") — stop another VM first (tart list)"
+  fi
+  wait_ssh 420 || die "'$VM' did not reach SSH in time (see $vmlog): $(tail -3 "$vmlog")"
+  log "up at $(vm_ip)"
+}
+
+# Push the payload and run it. Kept separate because a reboot wipes /tmp, so
+# everything has to be copied in again on the second pass.
+push_and_provision() {
+  local prov="$SKILL_DIR/provision/provision.sh" uictl ip
+  uictl="$(build_uictl)" || exit 1
+  ip="$(vm_ip)"
+  scp -i "$KEY" "${ssh_opts[@]}" -q "$uictl" "$GUEST_USER@$ip:/tmp/uictl" || die "copy uictl failed"
+  gssh 'mkdir -p ~/bin && mv /tmp/uictl ~/bin/uictl && chmod +x ~/bin/uictl'
+  scp -i "$KEY" "${ssh_opts[@]}" -q "$prov" "$GUEST_USER@$ip:/tmp/provision.sh" || die "copy provision failed"
+  gssh "TART_PASS='$GUEST_PASS' bash /tmp/provision.sh"
+}
+
+cmd_provision() {
+  [ -f "$SKILL_DIR/provision/provision.sh" ] || die "missing $SKILL_DIR/provision/provision.sh"
+  install_key
+  push_and_provision
+  local rc=$?
+  if [ $rc -eq 42 ]; then
+    # SIP was just switched off; it only takes effect after a restart.
+    log "rebooting to apply the SIP change"
+    gssh 'sync; sudo shutdown -r now' >/dev/null 2>&1 || true
+    sleep 20
+    wait_ssh 420 || die "'$VM' did not come back after reboot"
+    push_and_provision || die "provisioning failed after reboot"
+  elif [ $rc -ne 0 ]; then
+    die "provisioning failed"
+  fi
+}
+
+# Each attempt uses a new ssh connection by design: tccd caches its verdict per
+# sshd session, so a session that predates the grant stays denied.
+cmd_verify() {
+  local i
+  for i in $(seq 1 10); do
+    if gssh 'screencapture -x -t png /tmp/tart-ui-probe.png >/dev/null 2>&1; s=0; [ -s /tmp/tart-ui-probe.png ] || s=1; rm -f /tmp/tart-ui-probe.png; [ $s -eq 0 ] && ~/bin/uictl size >/dev/null' 2>/dev/null; then
+      gssh 'touch ~/.tart-ui-provisioned; sync'
+      return 0
+    fi
+    # A granted capture can still fail while macOS's "…requesting to bypass
+    # the system private window picker" sheet is in front of it. Clearing the
+    # sheet is a no-op when none is present.
+    [ $i -ge 2 ] && cmd_button Allow >/dev/null 2>&1
+    sleep 3
+  done
+  return 1
+}
+
+cmd_up() {
+  cmd_create; cmd_boot
+  if gssh 'test -f ~/.tart-ui-provisioned' 2>/dev/null && cmd_verify; then
+    log "already provisioned"
+  else
+    cmd_provision
+    cmd_verify || die "provisioned, but screen capture is still denied.
+        Check: tart-ui sh 'csrutil status'  (must say disabled)
+        and    tart-ui sh \"log show --last 2m --predicate 'subsystem == \\\"com.apple.TCC\\\"' --style compact | grep AUTHREQ\""
+  fi
+  log "ready — TART_VM=$VM ip=$(vm_ip) display=$(gssh '~/bin/uictl size')"
+}
+
+cmd_down() {
+  # Shut down from inside: `tart stop` is a hard power cut that loses writes.
+  vm_running || { log "'$VM' is not running"; return 0; }
+  log "shutting '$VM' down from inside"
+  gssh 'sync; sudo shutdown -h now' >/dev/null 2>&1 || true
+  local deadline=$((SECONDS + 150))
+  while [ $SECONDS -lt $deadline ]; do
+    vm_running || { log "stopped"; return 0; }
+    sleep 2
+  done
+  log "guest ignored the shutdown; forcing"
+  tart stop "$VM" -t 30
+}
+
+cmd_bake() {
+  local target="${1:?usage: tart-ui bake <new-image-name>}"
+  cmd_down
+  tart list 2>/dev/null | awk '{print $2}' | grep -qx "$target" \
+    && die "'$target' already exists — delete it first or pick another name"
+  log "freezing '$VM' into '$target'"
+  tart clone "$VM" "$target" || die "clone failed"
+  log "done. Reuse it with:  TART_IMAGE=$target TART_VM=<new> tart-ui up"
+}
+
+# --------------------------------------------------------------------- screen
+# Two screencapture behaviours shape this:
+#  - it refuses any dot-prefixed filename ("cannot write file to intended
+#    destination") in every directory, so the temp name must not start with a
+#    dot;
+#  - it exits 0 even when that write fails, so the file is the only reliable
+#    success signal.
+cmd_shot() {
+  local out="${1:--}" r="/tmp/tart-ui-shot.$$.png"
+  local remote="screencapture -x -t png '$r' >/dev/null 2>&1; if [ -s '$r' ]; then cat '$r'; rm -f '$r'; else rm -f '$r'; exit 1; fi"
+  if [ "$out" = "-" ]; then
+    gssh "$remote"
+  else
+    gssh "$remote" > "$out" || { rm -f "$out"; die "capture failed — provisioned? GUI logged in?"; }
+    [ -s "$out" ] || { rm -f "$out"; die "capture produced an empty file"; }
+    log "wrote $out ($(file -b "$out" | cut -d, -f2 | tr -d ' '))"
+  fi
+}
+
+# ---------------------------------------------------------------------- input
+U='~/bin/uictl'
+cmd_click()  { gssh "$U click $1 $2 ${3:-left} ${4:-1}"; }
+cmd_dclick() { gssh "$U click $1 $2 left 2"; }
+cmd_rclick() { gssh "$U click $1 $2 right 1"; }
+cmd_move()   { gssh "$U move $1 $2"; }
+cmd_drag()   { gssh "$U drag $1 $2 $3 $4"; }
+cmd_scroll() { gssh "$U scroll ${1:--3} ${2:-0}"; }
+cmd_size()   { gssh "$U size"; }
+
+cmd_type() {
+  # base64 so quoting and UTF-8 survive two shells in a row.
+  local b64; b64="$(printf '%s' "$*" | base64)"
+  gssh "$U type \"\$(printf %s '$b64' | base64 --decode)\""
+}
+
+# "cmd+shift+4" -> uictl key 4 cmd shift
+cmd_key() {
+  local combo="$*" mods=() k out=""
+  IFS='+' read -ra parts <<< "$combo"
+  for k in "${parts[@]}"; do
+    case "$k" in
+      cmd|command|ctrl|control|alt|opt|option|shift|fn) mods+=("$k") ;;
+      *) out="$k" ;;
+    esac
+  done
+  [ -n "$out" ] || die "no key in '$combo'"
+  gssh "$U key $out ${mods[*]:-}"
+}
+
+# ------------------------------------------------------------------ app focus
+cmd_frontmost() {
+  gssh 'osascript -e '"'"'tell application "System Events" to get name of first process whose frontmost is true'"'"''
+}
+
+# Two separate conditions have to hold before an app can receive keystrokes,
+# and they do not become true together: the process takes focus first, and its
+# window can appear a second or more later. Waiting on focus alone sends input
+# to a window that does not exist yet.
+cmd_open() {
+  local app="${1:?usage: tart-ui open <AppName>}"
+  gssh "open -a '$app' || exit 1
+        for i in \$(seq 1 60); do
+          f=\$(osascript -e 'tell application \"System Events\" to get name of first process whose frontmost is true' 2>/dev/null)
+          if [ \"\$f\" = '$app' ]; then
+            w=\$(osascript -e 'tell application \"System Events\" to tell process \"$app\" to get count of windows' 2>/dev/null)
+            [ \"\${w:-0}\" -gt 0 ] 2>/dev/null && { echo \"ready: $app (\$w window(s))\"; exit 0; }
+          fi
+          sleep 0.5
+        done
+        echo \"WARN: '$app' not ready after 30s (frontmost=\$f windows=\${w:-0})\" >&2; exit 1"
+}
+
+# Click a button by its accessibility name. The scan covers every process, not
+# only the frontmost one: macOS's screen-recording consent sheet belongs to
+# UserNotificationCenter rather than to the app being driven.
+cmd_button() {
+  local name="${1:?usage: tart-ui button <ButtonName>}"
+  gssh "osascript -e '
+    tell application \"System Events\"
+      repeat with p in (every application process)
+        try
+          repeat with w in (every window of p)
+            try
+              click (first button of w whose name is \"$name\")
+              return \"clicked in \" & (name of p)
+            end try
+          end repeat
+        end try
+      end repeat
+    end tell
+    return \"not found: $name\"'"
+}
+
+# The screen-recording consent sheet, by name. Harmless when none is showing.
+cmd_allow() { cmd_button Allow; }
+
+# ------------------------------------------------------------------- commands
+cmd_sh()   { gssh "$@"; }
+cmd_push() { scp -i "$KEY" "${ssh_opts[@]}" -q -r "$1" "$GUEST_USER@$(vm_ip):$2"; }
+cmd_pull() { scp -i "$KEY" "${ssh_opts[@]}" -q -r "$GUEST_USER@$(vm_ip):$1" "$2"; }
+
+cmd_xctest() {
+  gssh 'xcode-select -p >/dev/null 2>&1' \
+    || die "no Xcode in this guest. Install one inside the VM, or clone from an
+        image that ships it (ghcr.io/cirruslabs/macos-tahoe-xcode:latest)."
+  gssh "xcodebuild $*"
+}
+
+usage() {
+  cat >&2 <<EOF
+tart-ui — see and drive a Tart macOS VM over plain SSH (every call is one-shot)
+
+  Lifecycle   up | down | bake <image> | provision | rm | ip | status
+  Eyes        shot [FILE|-]            PNG of the guest screen, 1:1 with click coords
+              size                     display size
+  Hands       click X Y [left|right] [n] | dclick | rclick | move | drag X1 Y1 X2 Y2
+              scroll DY [DX] | type <text> | key <combo>       e.g. key cmd+space
+  Focus       open <AppName>           launch and wait until it owns the keyboard
+              frontmost | button <Name> | allow   (clears the consent sheet)
+  Commands    sh <cmd…> | push <l> <r> | pull <r> <l> | xctest <xcodebuild args…>
+
+  Env: TART_VM(=$VM) TART_IMAGE(=$IMAGE) TART_DISPLAY(=$DISPLAY_SIZE) TART_CPU TART_MEMORY
+EOF
+  exit 2
+}
+
+command -v tart >/dev/null || die "tart is not installed (brew install cirruslabs/cli/tart)"
+[ $# -gt 0 ] || usage
+if [ "$1" = "--vm" ]; then VM="$2"; shift 2; fi
+[ $# -gt 0 ] || usage
+sub="$1"; shift
+case "$sub" in
+  up) cmd_up "$@" ;;            create) cmd_create "$@" ;;
+  boot) cmd_boot "$@" ;;        provision) cmd_provision "$@" ;;
+  down|stop) cmd_down "$@" ;;   bake) cmd_bake "$@" ;;
+  rm|delete) cmd_down; tart delete "$VM" ;;
+  ip) vm_ip ;;                  status|list) tart list ;;
+  shot|screenshot) cmd_shot "$@" ;;   size) cmd_size ;;
+  click) cmd_click "$@" ;;      dclick|doubleclick) cmd_dclick "$@" ;;
+  rclick|rightclick) cmd_rclick "$@" ;; move) cmd_move "$@" ;;
+  drag) cmd_drag "$@" ;;        scroll) cmd_scroll "$@" ;;
+  type) cmd_type "$@" ;;        key) cmd_key "$@" ;;
+  open) cmd_open "$@" ;;        frontmost) cmd_frontmost ;;
+  button) cmd_button "$@" ;;  allow) cmd_allow ;;
+  sh|exec) cmd_sh "$@" ;;       push) cmd_push "$@" ;;  pull) cmd_pull "$@" ;;
+  xctest) cmd_xctest "$@" ;;
+  *) usage ;;
+esac
