@@ -113,7 +113,15 @@ cmd_boot() {
   log "booting '$VM' headless"
   local vmlog="$CONF_DIR/logs/$VM.log"
   : > "$vmlog"
-  nohup tart run "$VM" --no-graphics --no-audio </dev/null >>"$vmlog" 2>&1 &
+  # Audio pass-through is off by default because it is noise for UI work, but an
+  # audio app under test needs it: TART_AUDIO=1. Spelled out as two branches
+  # because macOS ships bash 3.2, where `set -u` rejects an empty array
+  # expansion.
+  if [ "${TART_AUDIO:-0}" = "1" ]; then
+    nohup tart run "$VM" --no-graphics </dev/null >>"$vmlog" 2>&1 &
+  else
+    nohup tart run "$VM" --no-graphics --no-audio </dev/null >>"$vmlog" 2>&1 &
+  fi
   disown
   # macOS caps concurrent VZ guests (2 on most Macs). Report that immediately
   # rather than waiting out the full SSH timeout on a VM that never started.
@@ -331,6 +339,7 @@ tart-ui — see and drive a Tart macOS VM over plain SSH (every call is one-shot
   Commands    sh <cmd…> | push <l> <r> | pull <r> <l> | xctest <xcodebuild args…>
 
   Env: TART_VM(=$VM) TART_IMAGE(=$IMAGE) TART_DISPLAY(=$DISPLAY_SIZE) TART_CPU TART_MEMORY
+       TART_AUDIO=1 to pass host audio through to the guest
 EOF
   exit 2
 }

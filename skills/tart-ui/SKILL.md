@@ -104,6 +104,18 @@ Bake after installing anything worth keeping. **Shut down with `tart-ui down`,
 never `tart stop`** — `tart stop` is a hard power cut that discards unsynced
 writes without warning.
 
+## What this VM is not
+
+Provisioning disables SIP, so **the guest is not a faithful stand-in for a user's
+Mac wherever SIP is what changes the behaviour**. Anything refused with
+"Operation not permitted while System Integrity Protection is engaged" — most
+`launchctl` verbs against system domains, writes under `/System`, attaching to
+platform binaries — will *succeed here and fail in the field*. A test that
+depends on that boundary passes in this VM and tells you nothing. Verify those
+paths on a SIP-on machine.
+
+Audio pass-through is off unless `TART_AUDIO=1`, and the guest has no camera.
+
 ## When something looks wrong
 
 | Symptom | Cause |
