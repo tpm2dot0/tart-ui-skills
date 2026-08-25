@@ -348,15 +348,18 @@ usage() {
   cat >&2 <<EOF
 tart-ui — see and drive a Tart macOS VM over plain SSH (every call is one-shot)
 
-  Lifecycle   up | down | bake <image> | provision | rm | ip | status
+  Lifecycle   up [VM] | down [VM] | bake <image> | provision [VM] | rm [VM] | ip [VM] | status
   Eyes        shot [FILE|-]            PNG of the guest screen, 1:1 with click coords
               size                     display size
   Hands       click X Y [left|right] [n] | dclick | rclick | move | drag X1 Y1 X2 Y2
               scroll DY [DX] | type <text> | key <combo>       e.g. key cmd+space
   Focus       open <AppName>           launch and wait until it owns the keyboard
               frontmost | button <Name> | allow   (clears the consent sheet)
-  Watching    watch                    open a live screen-sharing view of the VM
+  Watching    watch [VM]               open a live screen-sharing view of the VM
   Commands    sh <cmd…> | push <l> <r> | pull <r> <l> | xctest <xcodebuild args…>
+
+  A VM-scoped command takes the VM name inline: `tart-ui watch babel-ui`.
+  Otherwise TART_VM (or --vm) selects it.
 
   Env: TART_VM(=$VM) TART_IMAGE(=$IMAGE) TART_DISPLAY(=$DISPLAY_SIZE) TART_CPU TART_MEMORY
        TART_AUDIO=1 to pass host audio through to the guest
@@ -369,6 +372,17 @@ command -v tart >/dev/null || die "tart is not installed (brew install cirruslab
 if [ "$1" = "--vm" ]; then VM="$2"; shift 2; fi
 [ $# -gt 0 ] || usage
 sub="$1"; shift
+
+# The VM-scoped subcommands take no other argument, so a bare name after them is
+# the VM to act on. Consuming it here is what stops `tart-ui rm some-vm` from
+# silently ignoring the name and operating on the default one instead.
+case "$sub" in
+  up|boot|create|provision|down|stop|rm|delete|ip|watch|size|frontmost|allow)
+    if [ $# -gt 0 ]; then VM="$1"; shift; fi
+    [ $# -eq 0 ] || die "'$sub' takes at most a VM name, got: $*"
+    ;;
+esac
+
 case "$sub" in
   up) cmd_up "$@" ;;            create) cmd_create "$@" ;;
   boot) cmd_boot "$@" ;;        provision) cmd_provision "$@" ;;
