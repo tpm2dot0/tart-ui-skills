@@ -94,6 +94,14 @@ sudo sqlite3 "$SYS_DB" \
 sync
 sudo killall tccd 2>/dev/null; killall tccd 2>/dev/null; sleep 2
 
+# ----------------------------------------------------------------- watching
+# Headless is the right default for automation, but a person watching a run
+# needs a way in that does not require restarting the VM. macOS's own screen
+# sharing server listens on 5900 and can be attached to and detached from at
+# will, so arm it here and let `tart-ui watch` open a viewer on demand.
+sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+  -activate -configure -access -on -restart -agent -privs -all >/dev/null 2>&1
+
 # ------------------------------------------------------------------ settings
 # Keep the screen on and still, so captures are reproducible.
 sudo pmset -a displaysleep 0 sleep 0 disksleep 0 >/dev/null 2>&1

@@ -313,6 +313,25 @@ cmd_button() {
 # The screen-recording consent sheet, by name. Harmless when none is showing.
 cmd_allow() { cmd_button Allow; }
 
+# -------------------------------------------------------------------- viewing
+# Open a live view of the running VM. Nothing is restarted and the automation is
+# unaffected: this is macOS screen sharing alongside the SSH channel, so a
+# person can watch a run in progress and take over the mouse if they want to.
+cmd_watch() {
+  local ip; ip="$(vm_ip)"
+  [ -n "$ip" ] || die "VM '$VM' is not running"
+  if ! nc -z -G 3 "$ip" 5900 2>/dev/null; then
+    log "enabling screen sharing in the guest"
+    gssh 'sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+            -activate -configure -access -on -restart -agent -privs -all >/dev/null 2>&1' || true
+    local i
+    for i in 1 2 3 4 5 6 7 8; do nc -z -G 3 "$ip" 5900 2>/dev/null && break; sleep 2; done
+  fi
+  nc -z -G 3 "$ip" 5900 2>/dev/null || die "screen sharing did not come up on $ip:5900"
+  log "opening a viewer on $ip (close the window to detach; the VM keeps running)"
+  open "vnc://$GUEST_USER:$GUEST_PASS@$ip"
+}
+
 # ------------------------------------------------------------------- commands
 cmd_sh()   { gssh "$@"; }
 cmd_push() { scp -i "$KEY" "${ssh_opts[@]}" -q -r "$1" "$GUEST_USER@$(vm_ip):$2"; }
@@ -336,6 +355,7 @@ tart-ui — see and drive a Tart macOS VM over plain SSH (every call is one-shot
               scroll DY [DX] | type <text> | key <combo>       e.g. key cmd+space
   Focus       open <AppName>           launch and wait until it owns the keyboard
               frontmost | button <Name> | allow   (clears the consent sheet)
+  Watching    watch                    open a live screen-sharing view of the VM
   Commands    sh <cmd…> | push <l> <r> | pull <r> <l> | xctest <xcodebuild args…>
 
   Env: TART_VM(=$VM) TART_IMAGE(=$IMAGE) TART_DISPLAY(=$DISPLAY_SIZE) TART_CPU TART_MEMORY
@@ -361,6 +381,7 @@ case "$sub" in
   drag) cmd_drag "$@" ;;        scroll) cmd_scroll "$@" ;;
   type) cmd_type "$@" ;;        key) cmd_key "$@" ;;
   open) cmd_open "$@" ;;        frontmost) cmd_frontmost ;;
+  watch) cmd_watch ;;
   button) cmd_button "$@" ;;  allow) cmd_allow ;;
   sh|exec) cmd_sh "$@" ;;       push) cmd_push "$@" ;;  pull) cmd_pull "$@" ;;
   xctest) cmd_xctest "$@" ;;
