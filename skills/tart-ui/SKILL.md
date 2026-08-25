@@ -143,10 +143,10 @@ What it does not cover:
 | `up` reports the desktop never came back | The console is on loginwindow. `tart-ui shot` to see it, then `tart-ui login`. |
 | A screenshot is uniformly black | The display slept. Provisioning disables sleep; on a fresh unprovisioned guest, any input wakes it. |
 | Clicks land, keystrokes don't | Focus, not input. Check `tart-ui frontmost`; a login/lock screen also drops normal-speed keys — use `tart-ui login`. |
-| A modifier chord does nothing | Use `cmd`/`opt`/`ctrl`/`shift` names; wheel scrolling and Home/End/PageUp/PageDown are not delivered by the VNC server (see references/backends.md). |
+| A modifier chord does nothing | Use `cmd`/`opt`/`ctrl`/`shift` names; wheel scrolling and Home/End/PageUp/PageDown are not delivered by the VNC server (see references/how-it-works.md). |
 | `exceeds the system limit` | Two VMs already running. |
 
-[references/backends.md](references/backends.md) documents how the VNC channel
+[references/how-it-works.md](references/how-it-works.md) documents how the VNC channel
 works — endpoint discovery, the pseudo-encoding requirement, the keysym and
 button maps, pacing, and the channel's limits. Read it before changing
 `bin/rfb.py` or `provision/provision.sh`.

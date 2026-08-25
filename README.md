@@ -48,7 +48,7 @@ the guest is on a real logged-in desktop before reporting the VM ready.
 
 Screen capture, pointer and keyboard all travel over the one VNC channel; the
 guest is never asked to grant a permission or relax a protection.
-[skills/tart-ui/references/backends.md](skills/tart-ui/references/backends.md)
+[skills/tart-ui/references/how-it-works.md](skills/tart-ui/references/how-it-works.md)
 documents the mechanism in detail.
 
 ## Scope

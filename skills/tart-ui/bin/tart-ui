@@ -6,7 +6,7 @@
 # all go over that one RFB channel while SIP stays enabled in the guest and
 # nothing is written to the TCC databases. Commands run over plain SSH.
 # Every subcommand is one-shot: no daemon, no persistent connection, no session
-# state to keep in sync. See references/backends.md.
+# state to keep in sync. See references/how-it-works.md.
 set -uo pipefail
 
 VM="${TART_VM:-uitest}"
