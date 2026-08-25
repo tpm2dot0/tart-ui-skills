@@ -358,7 +358,7 @@ tart-ui — see and drive a Tart macOS VM over plain SSH (every call is one-shot
   Watching    watch [VM]               open a live screen-sharing view of the VM
   Commands    sh <cmd…> | push <l> <r> | pull <r> <l> | xctest <xcodebuild args…>
 
-  A VM-scoped command takes the VM name inline: `tart-ui watch babel-ui`.
+  A VM-scoped command takes the VM name inline, e.g.  tart-ui watch my-vm
   Otherwise TART_VM (or --vm) selects it.
 
   Env: TART_VM(=$VM) TART_IMAGE(=$IMAGE) TART_DISPLAY(=$DISPLAY_SIZE) TART_CPU TART_MEMORY
